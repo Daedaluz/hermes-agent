@@ -1,0 +1,51 @@
+name: fluxer-platform
+label: Fluxer
+kind: platform
+version: 1.0.0
+description: >
+  Fluxer gateway adapter for Hermes Agent.
+  Connects to a Fluxer instance (hosted or self-hosted) via its Discord-shaped
+  REST API + WebSocket gateway and relays messages between Fluxer
+  guilds/channels/DMs and the Hermes agent. Supports replies, reactions,
+  native file attachments, mention gating, and home-channel cron delivery.
+  No SDK required — raw aiohttp against the documented wire protocol.
+author: NousResearch
+requires_env:
+  - name: FLUXER_BOT_TOKEN
+    description: "Fluxer bot token"
+    prompt: "Fluxer bot token"
+    url: "https://fluxer.app/developers/applications"
+    password: true
+optional_env:
+  - name: FLUXER_API_BASE_URL
+    description: "Fluxer API base URL (default https://api.fluxer.app/v1 — point at your own instance if self-hosting)"
+    prompt: "API base URL (empty for hosted fluxer.app)"
+    password: false
+  - name: FLUXER_ALLOWED_USERS
+    description: "Comma-separated Fluxer user IDs allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: FLUXER_ALLOW_ALL_USERS
+    description: "Allow any Fluxer user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: FLUXER_HOME_CHANNEL
+    description: "Default channel ID for cron / notification delivery"
+    prompt: "Home channel ID"
+    password: false
+  - name: FLUXER_HOME_CHANNEL_NAME
+    description: "Display name for the Fluxer home channel"
+    prompt: "Home channel display name"
+    password: false
+  - name: FLUXER_REQUIRE_MENTION
+    description: "Require @bot mention in guild channels (default true). Set false for free-response everywhere."
+    prompt: "Require @mention? (true/false)"
+    password: false
+  - name: FLUXER_FREE_RESPONSE_CHANNELS
+    description: "Comma-separated channel IDs where @mention is not required."
+    prompt: "Free-response channel IDs (comma-separated)"
+    password: false
+  - name: FLUXER_ALLOWED_CHANNELS
+    description: "If set, the bot only responds in these guild channels (whitelist)."
+    prompt: "Allowed channel IDs (comma-separated)"
+    password: false

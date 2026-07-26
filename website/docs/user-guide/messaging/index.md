@@ -6,7 +6,7 @@ description: "Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, 
 
 # Messaging Gateway
 
-Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Feishu/Lark, WeCom, Weixin, BlueBubbles (iMessage), QQ, Yuanbao, Microsoft Teams, LINE, ntfy, or your browser. The gateway is a single background process that connects to all your configured platforms, handles sessions, runs cron jobs, and delivers voice messages.
+Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Fluxer, Matrix, DingTalk, Feishu/Lark, WeCom, Weixin, BlueBubbles (iMessage), QQ, Yuanbao, Microsoft Teams, LINE, ntfy, or your browser. The gateway is a single background process that connects to all your configured platforms, handles sessions, runs cron jobs, and delivers voice messages.
 
 For the full voice feature set — including CLI microphone mode, spoken replies in messaging, and Discord voice-channel conversations — see [Voice Mode](/user-guide/features/voice-mode) and [Use Voice Mode with Hermes](/guides/use-voice-mode-with-hermes).
 
@@ -29,6 +29,7 @@ Bots need both a model provider and tool providers (TTS, web). A [Nous Portal](/
 | Email | — | ✅ | ✅ | ✅ | — | — | — |
 | Home Assistant | — | — | — | — | — | — | — |
 | Mattermost | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
+| Fluxer | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
 | Matrix | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | DingTalk | — | ✅ | ✅ | — | ✅ | — | ✅ |
 | Feishu/Lark | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -69,6 +70,7 @@ flowchart TB
             em[Email]
             ha[Home Assistant]
             mm[Mattermost]
+            fx[Fluxer]
             mx[Matrix]
             dt[DingTalk]
     fs[Feishu/Lark]
@@ -98,6 +100,7 @@ flowchart TB
     em --> store
     ha --> store
     mm --> store
+    fx --> store
     mx --> store
     dt --> store
     fs --> store
@@ -639,6 +642,7 @@ Each platform has its own toolset:
 | Email | `hermes-email` | Full tools including terminal |
 | Home Assistant | `hermes-homeassistant` | Full tools + HA device control (ha_list_entities, ha_get_state, ha_call_service, ha_list_services) |
 | Mattermost | `hermes-mattermost` | Full tools including terminal |
+| Fluxer | `hermes-fluxer` | Full tools including terminal (auto-generated plugin toolset) |
 | Matrix | `hermes-matrix` | Full tools including terminal |
 | DingTalk | `hermes-dingtalk` | Full tools including terminal |
 | Feishu/Lark | `hermes-feishu` | Full tools including terminal |
@@ -783,6 +787,7 @@ Defaults to `false`. Only platforms whose adapter implements `delete_message` ho
 - [Email Setup](email.md)
 - [Home Assistant Integration](homeassistant.md)
 - [Mattermost Setup](mattermost.md)
+- [Fluxer Setup](fluxer.md)
 - [Matrix Setup](matrix.md)
 - [DingTalk Setup](dingtalk.md)
 - [Feishu/Lark Setup](feishu.md)
