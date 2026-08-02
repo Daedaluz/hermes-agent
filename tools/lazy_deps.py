@@ -246,6 +246,11 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # defusedxml only; aiohttp/httpx are core dependencies of every messaging
     # adapter and ship via `platform.discord` / `platform.slack` / etc.
     "platform.wecom_callback": ("defusedxml==0.7.1",),
+    # Fluxer voice channels / DM calls — Fluxer's media plane is LiveKit
+    # (WebRTC). The text adapter needs nothing beyond aiohttp; only a voice
+    # join pulls this in (plugins/platforms/fluxer/voice.py:_require_rtc).
+    # Mirrored as the `fluxer-voice` extra in pyproject.
+    "platform.fluxer_voice": ("livekit==1.1.13",),
     # Microsoft Teams adapter — microsoft-teams-apps pulls a heavy tree
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
     # installed on demand like every other messaging platform; also exposed

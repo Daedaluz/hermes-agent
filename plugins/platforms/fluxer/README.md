@@ -58,6 +58,37 @@ fluxer:
   button equivalent (verified against its OpenAPI spec), so approval and
   clarify prompts degrade to the plain-text flow automatically.
 
+## Voice (voice channels + DM calls)
+
+Fluxer's media plane is **LiveKit (WebRTC)**, not Discord's UDP/RTP.  The
+adapter signals over the existing gateway websocket (op 4
+`VOICE_STATE_UPDATE` → `VOICE_SERVER_UPDATE` with a LiveKit endpoint +
+JWT) and then joins the LiveKit room for audio.
+
+- **Guild voice channels**: type `/voice join` in a text channel while you
+  are in a voice channel — the bot joins, listens (speech-to-text), and
+  speaks replies (TTS, including streaming TTS).  `/voice leave`
+  disconnects; `/voice status` shows who's in the channel.
+- **DM calls**: ring the bot in a DM and it auto-answers (allowed users
+  only; disable with `FLUXER_AUTO_ANSWER_CALLS=false`).
+- **Inactivity**: the bot auto-leaves after `FLUXER_VOICE_TIMEOUT` seconds
+  (default 300) of silence.
+- **Dependencies**: the `livekit` package (lazy-installed on first join, or
+  `pip install 'hermes-agent[fluxer-voice]'`) plus `ffmpeg` on PATH.
+
+> ⚠️ **E2EE downgrade**: Fluxer voice channels can be end-to-end encrypted
+> between human clients.  The server permits bot joins but **downgrades
+> E2EE for the whole channel while a bot is present**
+> (`guild_voice_e2ee.erl: join_downgrades_e2ee`) — participants will see
+> the E2EE indicator drop.  Don't invite the bot into calls whose privacy
+> depends on E2EE.
+
+```bash
+FLUXER_VOICE_ENABLED=true        # default
+FLUXER_AUTO_ANSWER_CALLS=true    # default; allowed users only
+FLUXER_VOICE_TIMEOUT=300         # seconds; 0 disables auto-leave
+```
+
 ## Protocol notes (derived from Fluxer source)
 
 - Opcodes: Discord-style numbering (`DISPATCH=0`, `HEARTBEAT=1`,

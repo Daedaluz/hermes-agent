@@ -18021,10 +18021,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _get_guild_id(event: MessageEvent) -> Optional[int]:
-        """Extract Discord guild_id from the raw message object."""
+        """Extract the guild_id from the raw message object.
+
+        Handles discord.py objects (attribute access), dict payloads from
+        raw-protocol adapters (Fluxer's MESSAGE_CREATE ``d`` dict), and the
+        SimpleNamespace used for synthetic voice-input events.
+        """
         raw = getattr(event, "raw_message", None)
         if raw is None:
             return None
+        # Raw-protocol adapters pass the wire payload dict through verbatim.
+        if isinstance(raw, dict):
+            gid = raw.get("guild_id")
+            return int(gid) if gid else None
         # Slash command interaction
         if hasattr(raw, "guild_id") and raw.guild_id:
             return int(raw.guild_id)
@@ -18035,14 +18044,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
-        """Join the user's current Discord voice channel."""
+        """Join the user's current voice channel (Discord, Fluxer, …)."""
         adapter = self._adapter_for_source(event.source)
         if not hasattr(adapter, "join_voice_channel"):
             return "Voice channels are not supported on this platform."
 
         guild_id = self._get_guild_id(event)
         if not guild_id:
-            return "This command only works in a Discord server."
+            return "This command only works in a server channel."
 
         voice_channel = await adapter.get_user_voice_channel(
             guild_id, event.source.user_id
@@ -18059,8 +18068,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Let the adapter's inactivity timer see the live voice-reply mode so it
         # doesn't disconnect a deliberately text-only (/voice off) session.
         if hasattr(adapter, "_voice_mode_getter"):
+            _voice_platform = event.source.platform
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
-                self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+                self._voice_key(_voice_platform, str(chat_id)), "off"
             )
 
         try:
@@ -18114,14 +18124,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_input_callback = None
         return "Left voice channel."
 
-    def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
+    def _handle_voice_timeout_cleanup(
+        self, chat_id: str, platform: "Platform" = Platform.DISCORD
+    ) -> None:
         """Called by the adapter when a voice channel times out.
 
         Cleans up runner-side voice_mode state that the adapter cannot reach.
+        ``platform`` defaults to Discord for back-compat with the Discord
+        adapter's single-argument callback; voice-capable plugin adapters
+        (Fluxer) pass their own platform.
         """
-        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
+        self._voice_mode[self._voice_key(platform, chat_id)] = "off"
         self._save_voice_modes()
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = self.adapters.get(platform)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
@@ -18166,14 +18181,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self, guild_id: int, user_id: int, transcript: str,
+        platform: "Platform" = Platform.DISCORD,
     ):
         """Handle transcribed voice from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
         adapter's full message pipeline (session, typing, agent, TTS reply).
+        ``platform`` defaults to Discord for back-compat with the Discord
+        adapter's three-argument callback; voice-capable plugin adapters
+        (Fluxer) pass their own platform.
         """
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = self.adapters.get(platform)
         if not adapter:
             return
 
@@ -18190,7 +18209,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.user_name = str(user_id)
         else:
             source = SessionSource(
-                platform=Platform.DISCORD,
+                platform=platform,
                 chat_id=str(text_ch_id),
                 user_id=str(user_id),
                 user_name=str(user_id),
@@ -18213,10 +18232,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Show transcript in text channel (after auth, with mention sanitization)
         try:
-            channel = adapter._client.get_channel(text_ch_id)
+            safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+            echo = f"**[Voice]** <@{user_id}>: {safe_text}"
+            # discord.py exposes a client channel object; raw-protocol
+            # adapters (Fluxer) fall back to the generic send path.
+            client = getattr(adapter, "_client", None)
+            channel = client.get_channel(text_ch_id) if client else None
             if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+                await channel.send(echo)
+            else:
+                await adapter.send(chat_id=str(text_ch_id), content=echo)
         except Exception:
             pass
 
@@ -22227,14 +22252,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _voice_channel_sidecar_note(self, event, source: SessionSource, session_key: str) -> Optional[str]:
         """Return a ``[Voice channel now: ...]`` note when VC state changed.
 
-        Compares the live Discord voice-channel context against the last
-        value delivered for this session and returns a note only on change
+        Compares the live voice-channel context against the last value
+        delivered for this session and returns a note only on change
         (including leaving the channel).  Unchanged state returns ``None`` so
         the per-turn member/speaking serialization cannot churn the prompt.
+        Applies to any adapter exposing ``get_voice_channel_context``
+        (Discord, Fluxer).
         """
-        if source.platform != Platform.DISCORD:
-            return None
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = self.adapters.get(source.platform)
         guild_id = self._get_guild_id(event)
         if not (guild_id and adapter and hasattr(adapter, "get_voice_channel_context")):
             return None
@@ -23450,16 +23475,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # other platform / when not in a voice channel.
         _voice_ack_fired = [False]
         _voice_ack_guild: List[Optional[int]] = [None]
-        if source.platform == Platform.DISCORD:
-            _va = self.adapters.get(Platform.DISCORD)
-            # source.chat_id is the linked text channel; resolve the guild whose
-            # voice connection is bound to it (mirrors DiscordAdapter.play_tts).
-            _vtc = getattr(_va, "_voice_text_channels", None)
-            if isinstance(_vtc, dict) and hasattr(_va, "voice_mixer_active"):
-                for _gid, _tc in _vtc.items():
-                    if str(_tc) == str(source.chat_id) and _va.voice_mixer_active(_gid):
-                        _voice_ack_guild[0] = _gid
-                        break
+        _va = self.adapters.get(source.platform)
+        # source.chat_id is the linked text channel; resolve the guild whose
+        # voice connection is bound to it (mirrors DiscordAdapter.play_tts).
+        # Applies to any adapter exposing the voice-mixer surface; adapters
+        # without it (or with the mixer disabled) skip the ack cleanly.
+        _vtc = getattr(_va, "_voice_text_channels", None)
+        if isinstance(_vtc, dict) and hasattr(_va, "voice_mixer_active"):
+            for _gid, _tc in _vtc.items():
+                if str(_tc) == str(source.chat_id) and _va.voice_mixer_active(_gid):
+                    _voice_ack_guild[0] = _gid
+                    break
         _voice_ack_loop = asyncio.get_running_loop()
 
         # voice_ack_callback extracted to TurnRunner.voice_ack_callback

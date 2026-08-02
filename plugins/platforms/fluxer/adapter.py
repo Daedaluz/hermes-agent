@@ -32,6 +32,18 @@ Environment variables:
     FLUXER_REQUIRE_MENTION         Require @mention in guild channels (default true)
     FLUXER_FREE_RESPONSE_CHANNELS  Channel IDs where no mention is needed
     FLUXER_ALLOWED_CHANNELS        If set, only respond in these guild channels
+    FLUXER_VOICE_ENABLED           Enable voice channels / calls (default true;
+                                   needs the ``livekit`` package + ffmpeg)
+    FLUXER_AUTO_ANSWER_CALLS       Auto-answer DM calls from allowed users
+                                   (default true)
+    FLUXER_VOICE_TIMEOUT           Voice inactivity timeout seconds (default
+                                   300; 0 disables)
+
+Voice support lives in ``voice.py`` (op 4 signaling + LiveKit media) — see
+that module's docstring for the protocol derivation.  NOTE: Fluxer voice
+channels can be end-to-end encrypted between human clients; the server
+allows bot joins but **downgrades E2EE for the whole channel** while the
+bot is present (``guild_voice_e2ee.erl``).
 """
 
 from __future__ import annotations
@@ -42,9 +54,10 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -110,6 +123,34 @@ _RECONNECT_JITTER = 0.2
 _IDENTIFY_PACE_SECONDS = 5.0
 
 _MENTION_RE = re.compile(r"<@!?(\d+)>")
+
+# Gateway opcode for voice signaling (client → server); the reply arrives
+# as VOICE_SERVER_UPDATE / VOICE_STATE_UPDATE dispatches on op 0.
+OP_VOICE_STATE_UPDATE = 4
+
+_voice_mod = None
+
+
+def _voice_module():
+    """Import the sibling ``voice.py`` module.
+
+    Works both as a package (``plugins.platforms.fluxer``) and when
+    ``adapter.py`` is loaded standalone from a file path (the test
+    loader), where relative imports are unavailable.
+    """
+    global _voice_mod
+    if _voice_mod is None:
+        try:
+            from . import voice as _v  # type: ignore
+        except ImportError:
+            import importlib.util
+            path = Path(__file__).with_name("voice.py")
+            spec = importlib.util.spec_from_file_location("plugin_fluxer_voice", path)
+            _v = importlib.util.module_from_spec(spec)
+            sys.modules["plugin_fluxer_voice"] = _v
+            spec.loader.exec_module(_v)
+        _voice_mod = _v
+    return _voice_mod
 
 
 def _mask_token(token: str) -> str:
@@ -187,6 +228,24 @@ class FluxerAdapter(BasePlatformAdapter):
 
         # Dedup cache (gateway may redeliver on resume)
         self._dedup = MessageDeduplicator()
+
+        # ── Voice (channels + DM calls) ──────────────────────────────
+        # Same duck-typed surface run.py uses for Discord voice: the
+        # attributes below are wired by GatewayRunner at connect time.
+        # Keys are int(guild_id) for guild voice, int(dm_channel_id)
+        # for DM calls (see voice.py module docstring).
+        self._voice_text_channels: Dict[int, int] = {}
+        self._voice_sources: Dict[int, dict] = {}
+        self._voice_input_callback: Optional[Callable] = None  # set by run.py
+        self._on_voice_disconnect: Optional[Callable] = None   # set by run.py
+        self._voice_mode_getter: Optional[Callable] = None     # set by run.py
+        # guild_id -> {user_id -> channel_id} from VOICE_STATE_UPDATE /
+        # GUILD_CREATE dispatches; backs get_user_voice_channel().
+        self._voice_states: Dict[str, Dict[str, str]] = {}
+        # Channel-id -> name cache (populated from GUILD_CREATE payloads
+        # and REST lookups) for join messages / status displays.
+        self._channel_names: Dict[str, str] = {}
+        self._voice = _voice_module().FluxerVoiceManager(self)
 
     # ------------------------------------------------------------------
     # REST helpers
@@ -352,6 +411,13 @@ class FluxerAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Close the gateway connection and HTTP session."""
         self._closing = True
+
+        # Leave any live voice sessions first (they hold LiveKit rooms and
+        # the websocket we're about to close).
+        try:
+            await self._voice.shutdown()
+        except Exception:
+            logger.debug("Fluxer: voice shutdown failed", exc_info=True)
 
         for task in (self._heartbeat_task, self._ws_task):
             if task and not task.done():
@@ -864,6 +930,9 @@ class FluxerAdapter(BasePlatformAdapter):
                 "Fluxer: gateway READY (session %s…)",
                 str(self._session_id or "")[:8],
             )
+            for guild in d.get("guilds") or []:
+                if isinstance(guild, dict):
+                    self._ingest_guild_voice_states(guild)
             return "established"
         if event == "RESUMED":
             logger.info("Fluxer: gateway session resumed")
@@ -877,7 +946,63 @@ class FluxerAdapter(BasePlatformAdapter):
         if event in {"MESSAGE_REACTION_ADD", "MESSAGE_REACTION_REMOVE"}:
             await self._on_reaction(event, d)
             return None
+        if event == "GUILD_CREATE":
+            self._ingest_guild_voice_states(d)
+            return None
+        if event == "VOICE_STATE_UPDATE":
+            self._on_voice_state_update(d)
+            return None
+        if event == "VOICE_SERVER_UPDATE":
+            try:
+                self._voice.on_voice_server_update(d)
+            except Exception:
+                logger.warning("Fluxer: VOICE_SERVER_UPDATE handling failed", exc_info=True)
+            return None
+        if event == "CALL_CREATE":
+            try:
+                self._voice.on_call_create(d)
+            except Exception:
+                logger.warning("Fluxer: CALL_CREATE handling failed", exc_info=True)
+            return None
         return None
+
+    # ------------------------------------------------------------------
+    # Voice-state cache (backs get_user_voice_channel / status)
+    # ------------------------------------------------------------------
+
+    def _ingest_guild_voice_states(self, guild: Dict[str, Any]) -> None:
+        """Seed the voice-state cache from a GUILD_CREATE payload."""
+        guild_id = str(guild.get("id") or "")
+        if not guild_id:
+            return
+        states = self._voice_states.setdefault(guild_id, {})
+        for vs in guild.get("voice_states") or []:
+            user_id = str(vs.get("user_id") or "")
+            channel_id = vs.get("channel_id")
+            if not user_id:
+                continue
+            if channel_id:
+                states[user_id] = str(channel_id)
+            else:
+                states.pop(user_id, None)
+        # Channel names for join messages / voice status.
+        for ch in guild.get("channels") or []:
+            cid = str(ch.get("id") or "")
+            if cid and ch.get("name"):
+                self._channel_names[cid] = str(ch["name"])
+
+    def _on_voice_state_update(self, d: Dict[str, Any]) -> None:
+        """Track which voice channel each user occupies."""
+        user_id = str(d.get("user_id") or "")
+        if not user_id:
+            return
+        guild_id = str(d.get("guild_id") or "") or "_dm"
+        channel_id = d.get("channel_id")
+        states = self._voice_states.setdefault(guild_id, {})
+        if channel_id:
+            states[user_id] = str(channel_id)
+        else:
+            states.pop(user_id, None)
 
     # ------------------------------------------------------------------
     # Inbound messages
@@ -1070,6 +1195,94 @@ class FluxerAdapter(BasePlatformAdapter):
                 logger.warning("Fluxer: error caching attachment %s", fname, exc_info=True)
         return media_urls, media_types
 
+    # ------------------------------------------------------------------
+    # Voice channels / calls — duck-typed surface used by gateway/run.py
+    # (mirrors the Discord adapter; see voice.py for transport details)
+    # ------------------------------------------------------------------
+
+    async def get_user_voice_channel(self, guild_id: int, user_id: str):
+        """Return the voice channel the user currently occupies, or None."""
+        channel_id = self._voice_states.get(str(guild_id), {}).get(str(user_id))
+        if not channel_id:
+            return None
+        name = self._channel_names.get(channel_id)
+        if not name:
+            try:
+                info = await self.get_chat_info(channel_id)
+                name = (info or {}).get("name") or ""
+                if name:
+                    self._channel_names[channel_id] = name
+            except Exception:
+                name = ""
+        voice = _voice_module()
+        return voice.FluxerVoiceChannel(channel_id, name, str(guild_id))
+
+    async def join_voice_channel(
+        self, channel, *, text_channel_id: int = None, source: dict = None
+    ) -> bool:
+        """Join a Fluxer voice channel.  Returns True on success."""
+        ok = await self._voice.join(channel)
+        if ok:
+            guild_id = getattr(channel.guild, "id", None)
+            key = int(guild_id) if guild_id else int(channel.id)
+            if text_channel_id is not None:
+                self._voice_text_channels[key] = int(text_channel_id)
+            if source is not None:
+                self._voice_sources[key] = source
+        return ok
+
+    async def leave_voice_channel(self, guild_id: int) -> None:
+        await self._voice.leave(int(guild_id))
+
+    def is_in_voice_channel(self, guild_id: int) -> bool:
+        return self._voice.is_connected(int(guild_id))
+
+    def get_voice_channel_info(self, guild_id: int) -> Optional[Dict[str, Any]]:
+        return self._voice.channel_info(int(guild_id))
+
+    def get_voice_channel_context(self, guild_id: int) -> str:
+        return self._voice.channel_context(int(guild_id))
+
+    async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
+        return await self._voice.play_file(int(guild_id), audio_path)
+
+    async def play_tts(self, chat_id: str, audio_path: str, **kwargs):
+        """Auto-TTS playback: play into the bound voice session when live.
+
+        Falls back to the base send_voice (audio attachment) when the chat
+        has no active voice connection.
+        """
+        session = self._voice.session_for_chat(str(chat_id))
+        if session is not None:
+            played = await self._voice.play_file(session.key, audio_path)
+            if played:
+                from gateway.platforms.base import SendResult
+                return SendResult(success=True, message_id=None)
+        return await super().play_tts(chat_id=chat_id, audio_path=audio_path, **kwargs)
+
+    # ── Streaming TTS adapter contract (#60671) ──────────────────────
+
+    def supports_streaming_tts(self, chat_id: str, audio_format) -> bool:
+        if int(getattr(audio_format, "sample_width", 2)) != 2:
+            return False
+        return self._voice.session_for_chat(str(chat_id)) is not None
+
+    async def begin_streaming_tts(self, chat_id: str, audio_format, metadata=None):
+        try:
+            return await self._voice.begin_streaming(str(chat_id), audio_format)
+        except Exception:
+            logger.debug("Fluxer: begin_streaming_tts failed", exc_info=True)
+            return None
+
+    async def write_streaming_tts(self, handle, chunk: bytes) -> None:
+        await self._voice.write_streaming(handle, chunk)
+
+    async def finish_streaming_tts(self, handle, *, interrupted: bool = False) -> None:
+        await self._voice.finish_streaming(handle, interrupted=interrupted)
+
+    async def abort_streaming_tts(self, handle, error: Optional[str] = None) -> None:
+        await self._voice.abort_streaming(handle)
+
 
 class _FatalGatewayError(RuntimeError):
     """Gateway condition that will never succeed on retry (bad token, etc.)."""
@@ -1248,6 +1461,14 @@ def _apply_yaml_config(yaml_cfg: dict, fluxer_cfg: dict) -> Optional[dict]:
         seeded["api_base_url"] = base
     if "require_mention" in fluxer_cfg and not os.getenv("FLUXER_REQUIRE_MENTION"):
         os.environ["FLUXER_REQUIRE_MENTION"] = str(fluxer_cfg["require_mention"]).lower()
+    for bool_key, env_key in (
+        ("voice_enabled", "FLUXER_VOICE_ENABLED"),
+        ("auto_answer_calls", "FLUXER_AUTO_ANSWER_CALLS"),
+    ):
+        if bool_key in fluxer_cfg and not os.getenv(env_key):
+            os.environ[env_key] = str(fluxer_cfg[bool_key]).lower()
+    if "voice_timeout" in fluxer_cfg and not os.getenv("FLUXER_VOICE_TIMEOUT"):
+        os.environ["FLUXER_VOICE_TIMEOUT"] = str(fluxer_cfg["voice_timeout"])
     for yaml_key, env_key in (
         ("free_response_channels", "FLUXER_FREE_RESPONSE_CHANNELS"),
         ("allowed_channels", "FLUXER_ALLOWED_CHANNELS"),
@@ -1391,6 +1612,9 @@ def register(ctx) -> None:
             "You are on Fluxer, a Discord-like chat platform. Messages render "
             "Discord-flavored markdown (bold, italics, code blocks, links). "
             "Messages are limited to 4000 characters (long replies are "
-            "automatically split). You can attach images and files natively."
+            "automatically split). You can attach images and files natively. "
+            "Voice is supported: users can /voice join you into a voice "
+            "channel or ring you in a DM call; you hear them via speech-to-"
+            "text and speak replies via TTS."
         ),
     )

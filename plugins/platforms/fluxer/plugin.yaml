@@ -7,8 +7,10 @@ description: >
   Connects to a Fluxer instance (hosted or self-hosted) via its Discord-shaped
   REST API + WebSocket gateway and relays messages between Fluxer
   guilds/channels/DMs and the Hermes agent. Supports replies, reactions,
-  native file attachments, mention gating, and home-channel cron delivery.
-  No SDK required — raw aiohttp against the documented wire protocol.
+  native file attachments, mention gating, home-channel cron delivery,
+  and voice (voice channels + DM calls via LiveKit: STT in, TTS out).
+  Text needs no SDK — raw aiohttp against the documented wire protocol;
+  voice lazily installs the livekit package on first join.
 author: NousResearch
 requires_env:
   - name: FLUXER_BOT_TOKEN
@@ -48,4 +50,16 @@ optional_env:
   - name: FLUXER_ALLOWED_CHANNELS
     description: "If set, the bot only responds in these guild channels (whitelist)."
     prompt: "Allowed channel IDs (comma-separated)"
+    password: false
+  - name: FLUXER_VOICE_ENABLED
+    description: "Enable voice channels / DM calls (default true; needs the livekit package + ffmpeg)."
+    prompt: "Enable voice? (true/false)"
+    password: false
+  - name: FLUXER_AUTO_ANSWER_CALLS
+    description: "Auto-answer DM calls rung by allowed users (default true)."
+    prompt: "Auto-answer DM calls? (true/false)"
+    password: false
+  - name: FLUXER_VOICE_TIMEOUT
+    description: "Voice inactivity timeout in seconds before auto-leaving (default 300; 0 disables)."
+    prompt: "Voice inactivity timeout (seconds)"
     password: false
